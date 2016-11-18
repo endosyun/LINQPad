@@ -7,58 +7,67 @@
   <Namespace>System.Threading.Tasks</Namespace>
 </Query>
 
-//設定
+//Common Settings
 public enum Member { dosyun, matzz, izak, shibayan, Kimuny }
 public enum Month { January = 1, February = 2, March = 3, April = 4, May = 5, June = 6, July = 7, August = 8, September = 9, October = 10, November = 11, December = 12 }
 
-public const string EndpointUrl = "https://slack.com/api/groups.history";
-public const string Token = "";
-public const string ChannelId =  "";
-public const int GetDataCount = 100;
+//Slack Settings
+public const string SlackHistoryApiEndpointUrl = "https://slack.com/api/groups.history";
+public const string SlackToken = "";
+public const string SlackChannelId = "";
+public const int GetDataCount = 1000;
+public const int AggregatePeriod = 300;
+
+//SpreadSheet Settings
+public const string SpreadSheetApiEndpointUrl = "https://sheets.googleapis.com/v4/spreadsheets/{0}:batchUpdate";
+public const string TargetSpreadSheetId = "";
+public const string GoogleOAuthAccessToken = "";
 
 void Main()
-{		
-	var url = string.Format("{0}?token={1}&channel={2}&count={3}", EndpointUrl, Token, ChannelId, GetDataCount);
-	sendRequest(url);
+{
+	var url = string.Format("{0}?token={1}&channel={2}&count={3}", SlackHistoryApiEndpointUrl, SlackToken, SlackChannelId, GetDataCount);
+	var json = SendRequest(url);
+	var createMemberMeasureResultList = CreateMeasureResult(json);
+	var text = CreateText(createMemberMeasureResultList).Dump();
+	WriteSpreadSheet(createMemberMeasureResultList);
+
 }
 
-private async Task sendRequest(string url)
+private string SendRequest(string url)
 {
-	var client = new HttpClient();
-	var request = new HttpRequestMessage();
+	var wc = new System.Net.WebClient();
+	var result = wc.DownloadData(new Uri(url));
+	return Encoding.UTF8.GetString(result);
+}
 
-	request.Method = HttpMethod.Get;
-	request.RequestUri = new Uri(url);
-
-	var response = await client.SendAsync(request);
-	string result = await response.Content.ReadAsStringAsync();
-
-	var deserialzeObject = JsonConvert.DeserializeObject<SlackResponse>(result.ToString());
-	var list = deserialzeObject.messages.Where(x => x.attachments != null)
+public MeasureResult[] CreateMeasureResult(string json)
+{
+	var deserialzeObject = JsonConvert.DeserializeObject<SlackResponse>(json);
+	return deserialzeObject.messages.Where(x => x.attachments != null)
 										.Select(y => new { Title = y.attachments.First().title, Text = y.attachments.First().text })
-										.Where(z => z.Text != null && z.Text.Contains("体重"))
+										.Where(z => z.Text != null && z.Text.Contains("体重") && !z.Title.Contains("Amazon") && !z.Title.Contains("ダイエット"))
 										.OrderBy(x => x.Title)
 										.Select(x =>
 										{
-											var member = GetMember(x.Title);                                               
+											var member = GetMember(x.Title);
 											var baseParseText = DeleteMemberName(x.Title);
 											var monthDeleteText = DeleteMonth(baseParseText);
 											var year = GetYear(monthDeleteText);
 											var month = GetMonth(baseParseText);
 											var day = GetDay(monthDeleteText);
 											var hour = GetHour(monthDeleteText);
-											var minute = GetMinute(monthDeleteText);											
+											var minute = GetMinute(monthDeleteText);
 											var weight = GetWeight(x.Text, member);
 											var fatRate = GetFatRate(x.Text, member);
 
 											return new MeasureResult() { Member = member, MeasureDate = new DateTime(year, month, day, hour, minute, 0), Weight = weight, FatRate = fatRate };
 										})
-										.Where(x => x.MeasureDate <= DateTime.Now && x.MeasureDate >= DateTime.Now.AddDays(-7))
+										.Where(x => x.MeasureDate <= DateTime.Now && x.MeasureDate >= DateTime.Now.AddDays(AggregatePeriod * -1))
 										.OrderByDescending(x => x.Member)
 										.ThenBy(x => x.MeasureDate)
 										.ToArray();
 
-	CreateText(list);
+
 }
 
 
@@ -80,10 +89,10 @@ public Member GetMember(string name)
 
 public string DeleteMemberName(string title)
 {
-	var members = Enum.GetValues(typeof(Member));	
+	var members = Enum.GetValues(typeof(Member));
 	foreach (var member in members)
 	{
-		title = title.Replace(member.ToString(),string.Empty);
+		title = title.Replace(member.ToString(), string.Empty);
 	}
 	return title.Replace("'s", string.Empty).Trim();
 }
@@ -105,7 +114,7 @@ public string DeleteMonth(string title)
 	foreach (var month in monthList)
 	{
 		title = title.Replace(month.ToString(), string.Empty);
-	}	
+	}
 	return title.Trim();
 }
 
@@ -170,11 +179,11 @@ public double GetFatRate(string text, Member memberName)
 }
 
 public string CreateText(MeasureResult[] result)
-{	
+{
 	var text = new StringBuilder();
 	foreach (var member in Enum.GetValues(typeof(Member)))
-	{		
-		var memberWeeklyResultList = result.Where(x => x.Member.ToString() ==  member.ToString())
+	{
+		var memberWeeklyResultList = result.Where(x => x.Member.ToString() == member.ToString())
 										   .GroupBy(x => x.MeasureDate.Date)
 										   .ToDictionary(x => x.Key, y => y.OrderBy(x => x.Weight).FirstOrDefault());
 
@@ -224,10 +233,84 @@ public string CreateText(MeasureResult[] result)
 		text.Append("\r\n");
 	}
 
-	return text.ToString().Dump();
+	return text.ToString();
 
 }
 
+public void WriteSpreadSheet(MeasureResult[] measureResultList)
+{
+	//valueを加算していくと列が増える
+	//rowを加算していくと行が増える
+	var rows = new List<Row>();
+	var firstValues = new List<Value>();
+	var firstRow = new Row();
+	//左上はダミー行
+	firstValues.Add(new Value());
+	var memberlist = measureResultList.GroupBy(x => x.Member).ToArray();
+	foreach (var member in memberlist)
+	{
+		//メンバーの名前を入れる
+		var value = new Value() { userEnteredValue = new UserEnteredvalue() { stringValue = member.Key.ToString() } };
+		firstValues.Add(value);
+		firstRow.values = firstValues.ToArray();
+	}
+	//1行目終了
+	rows.Add(firstRow);
+
+	var measureDateList = measureResultList.GroupBy(x => x.MeasureDate.ToString("yyyy/MM/dd")).OrderBy(x => x.Key).ToArray();
+
+	foreach (var date in measureDateList)
+	{
+		//日付を入れる
+		var secondValues = new List<Value>();
+		var value = new Value() { userEnteredValue = new UserEnteredvalue() { stringValue = date.Key } };
+		secondValues.Add(value);
+
+		foreach (var member in memberlist)
+		{
+			var memberMinWeightResult = member.Where(x => x.MeasureDate.ToString("yyyy/MM/dd") == date.Key).OrderBy(x => x.Weight).FirstOrDefault();
+			if (memberMinWeightResult != null)
+			{
+				var weightValue = new Value() { userEnteredValue = new UserEnteredvalue() { stringValue = memberMinWeightResult.Weight.ToString() } };
+				secondValues.Add(weightValue);
+			}
+			else
+			{
+				secondValues.Add(new Value());
+			}
+		}
+
+		var secondRow = new Row();
+		secondRow.values = secondValues.ToArray();
+		rows.Add(secondRow);
+	}
+	
+	var start = new Start() { rowIndex = 0, columnIndex = 0, sheetId = 0 };
+	var updCells = new Updatecells() { start = start, rows = rows.ToArray(), fields = "userEnteredValue" };
+	var req = new Request() { updateCells = updCells };
+	var reqs = new Request[] { req };
+	var root = new Rootobject() { requests = reqs };
+
+	var json = JsonConvert.SerializeObject(root);
+	var wc = new System.Net.WebClient();
+	wc.Headers.Add("Authorization", "Bearer " + GoogleOAuthAccessToken);
+	wc.Headers.Set("Content-Type", "application/json");
+	wc.Encoding = Encoding.UTF8;
+
+	var res = wc.UploadString(new Uri(string.Format(SpreadSheetApiEndpointUrl, TargetSpreadSheetId)), "POST", json);
+
+	wc.Dispose();
+}
+
+public class MeasureResult
+{
+	public Member Member;
+	public DateTime MeasureDate;
+	public double Weight;
+	public double FatRate;
+}
+
+//Slack Deserialize DTO
 public class SlackResponse
 {
 	public string ok;
@@ -247,10 +330,43 @@ public class SlackAttachment
 	public string text;
 }
 
-public class MeasureResult
+//SpreadSheet Deserialize DTO
+public class Rootobject
 {
-	public Member Member;
-	public DateTime MeasureDate;
-	public double Weight;
-	public double FatRate;
+	public Request[] requests { get; set; }
+}
+
+public class Request
+{
+	public Updatecells updateCells { get; set; }
+}
+
+public class Updatecells
+{
+	public Start start { get; set; }
+	public Row[] rows { get; set; }
+	public string fields { get; set; }
+
+}
+
+public class Start
+{
+	public int sheetId { get; set; }
+	public int rowIndex { get; set; }
+	public int columnIndex { get; set; }
+}
+
+public class Row
+{
+	public Value[] values { get; set; }
+}
+
+public class Value
+{
+	public UserEnteredvalue userEnteredValue { get; set; }
+}
+
+public class UserEnteredvalue
+{
+	public string stringValue { get; set; }
 }
